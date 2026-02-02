@@ -1,0 +1,9 @@
+<library path="custom_costmap_layers">
+  <class name="nav2_costmap_2d/TerrainGlobalLayer"
+         type="nav2_costmap_2d::TerrainGlobalLayer"
+         base_class_type="nav2_costmap_2d::Layer">
+    <description>
+      Layer that continuously merges terrain/sterling costmap into the global costmap
+    </description>
+  </class>
+</library>
