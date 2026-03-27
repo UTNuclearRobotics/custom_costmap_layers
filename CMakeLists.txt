@@ -13,7 +13,6 @@ find_package(sensor_msgs REQUIRED)
 
 add_library(${PROJECT_NAME} SHARED
   src/terrain_global_layer.cpp
-  src/ring_slope_stvl_layer.cpp
 )
 
 ament_target_dependencies(${PROJECT_NAME}
