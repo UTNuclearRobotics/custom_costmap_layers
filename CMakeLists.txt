@@ -14,7 +14,7 @@ find_package(spatio_temporal_voxel_layer REQUIRED)
 
 add_library(${PROJECT_NAME} SHARED
   src/terrain_global_layer.cpp
-  src/ring_slope_filter_layer.cpp
+  src/ring_slope_stvl_layer.cpp
 )
 
 ament_target_dependencies(${PROJECT_NAME}
