@@ -8,13 +8,17 @@
     </description>
   </class>
 
-  <class name="custom_costmap_layers/RingSlopeFilterLayer"
-         type="custom_costmap_layers::RingSlopeFilterLayer"
+  <class name="custom_costmap_layers/RingSlopeSTVLLayer"
+         type="custom_costmap_layers::RingSlopeSTVLLayer"
          base_class_type="nav2_costmap_2d::Layer">
     <description>
-      Preprocesses an organized PointCloud2 to suppress uneven ground returns
-      by comparing dz/dxy between adjacent lidar rings. Republishes the filtered
-      cloud for downstream STVL marking.
+      Drop-in replacement for SpatioTemporalVoxelLayer that applies a ring-based
+      slope filter to each organized PointCloud2 before STVL marks voxels.
+      Adjacent elevation ring points in each azimuth column are sorted by z and
+      compared pairwise; a point is suppressed only when both its upper and lower
+      elevation neighbours independently agree the transition resembles sloped
+      ground (dz/dxy <= slope_threshold). Configure identically to STVL plus two
+      additional params: slope_threshold and min_dz.
     </description>
   </class>
 

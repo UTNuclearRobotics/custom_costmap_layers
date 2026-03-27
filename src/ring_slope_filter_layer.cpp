@@ -12,87 +12,132 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "custom_costmap_layers/ring_slope_filter_layer.hpp"
+#include "custom_costmap_layers/ring_slope_stvl_layer.hpp"
 
 #include <pluginlib/class_list_macros.hpp>
 
 namespace custom_costmap_layers
 {
 
-RingSlopeFilterLayer::RingSlopeFilterLayer()
+RingSlopeSTVLLayer::RingSlopeSTVLLayer()
 : slope_threshold_(1.0),
   min_dz_(0.03)
 {
 }
 
-void RingSlopeFilterLayer::onInitialize()
+void RingSlopeSTVLLayer::onInitialize()
 {
   auto node = node_.lock();
   if (!node) {
-    throw std::runtime_error("RingSlopeFilterLayer: failed to lock node");
+    throw std::runtime_error("RingSlopeSTVLLayer: failed to lock node");
   }
 
-  declareParameter("input_topic", rclcpp::ParameterValue(std::string("/ouster/points")));
-  declareParameter("output_topic", rclcpp::ParameterValue(std::string("/ouster/points_filtered")));
+  // ── 1. Declare and read our filter-specific params ─────────────────────────
   declareParameter("slope_threshold", rclcpp::ParameterValue(1.0));
-  declareParameter("min_dz", rclcpp::ParameterValue(0.03));
-
-  node->get_parameter(name_ + "." + "input_topic",  input_topic_);
-  node->get_parameter(name_ + "." + "output_topic", output_topic_);
-  node->get_parameter(name_ + "." + "slope_threshold", slope_threshold_);
-  node->get_parameter(name_ + "." + "min_dz", min_dz_);
+  declareParameter("min_dz",          rclcpp::ParameterValue(0.03));
+  node->get_parameter(name_ + ".slope_threshold", slope_threshold_);
+  node->get_parameter(name_ + ".min_dz",          min_dz_);
 
   RCLCPP_INFO(
     node->get_logger(),
-    "[RingSlopeFilterLayer] input: %s  output: %s  slope_threshold: %.2f  min_dz: %.3f m",
-    input_topic_.c_str(), output_topic_.c_str(), slope_threshold_, min_dz_);
+    "[RingSlopeSTVLLayer] slope_threshold=%.2f  min_dz=%.3f m",
+    slope_threshold_, min_dz_);
 
-  // QoS matched to the typical sensor best-effort profile
+  // ── 2. Discover which observation sources have marking=true ────────────────
+  //    We must declare observation_sources ourselves before calling the parent
+  //    so that we can read the YAML value at this point.
+  declareParameter("observation_sources", rclcpp::ParameterValue(std::string("")));
+  std::string sources_str;
+  node->get_parameter(name_ + ".observation_sources", sources_str);
+
+  std::istringstream iss(sources_str);
+  std::vector<std::string> sources{
+    std::istream_iterator<std::string>(iss),
+    std::istream_iterator<std::string>()};
+
   auto qos = rclcpp::SensorDataQoS();
 
-  sub_ = node->create_subscription<sensor_msgs::msg::PointCloud2>(
-    input_topic_, qos,
-    std::bind(&RingSlopeFilterLayer::cloudCallback, this, std::placeholders::_1));
+  for (const auto & source : sources) {
+    // Read whether this source is a marking source
+    bool marking = false;
+    declareParameter(source + ".marking", rclcpp::ParameterValue(false));
+    node->get_parameter(name_ + "." + source + ".marking", marking);
+    if (!marking) {
+      continue;
+    }
 
-  pub_ = node->create_publisher<sensor_msgs::msg::PointCloud2>(output_topic_, qos);
+    // Read the original topic the user configured
+    std::string original_topic;
+    declareParameter(source + ".topic", rclcpp::ParameterValue(std::string("")));
+    node->get_parameter(name_ + "." + source + ".topic", original_topic);
+    if (original_topic.empty()) {
+      RCLCPP_WARN(
+        node->get_logger(),
+        "[RingSlopeSTVLLayer] marking source '%s' has no topic configured, skipping.",
+        source.c_str());
+      continue;
+    }
 
-  current_ = true;
+    // ── 3. Build an internal relay topic name ────────────────────────────────
+    //    Append source name to disambiguate when multiple marking sources
+    //    point at the same topic.
+    const std::string relay_topic = original_topic + "_rsf_" + source;
+
+    RCLCPP_INFO(
+      node->get_logger(),
+      "[RingSlopeSTVLLayer] intercepting marking source '%s': %s -> %s",
+      source.c_str(), original_topic.c_str(), relay_topic.c_str());
+
+    // ── 4. Override the topic param so STVL subscribes to the relay topic ────
+    node->set_parameter(
+      rclcpp::Parameter(name_ + "." + source + ".topic", relay_topic));
+
+    // ── 5. Create publisher (relay topic) and subscription (original topic) ──
+    auto pub = node->create_publisher<sensor_msgs::msg::PointCloud2>(relay_topic, qos);
+    pubs_.push_back(pub);
+
+    auto sub = node->create_subscription<sensor_msgs::msg::PointCloud2>(
+      original_topic, qos,
+      [this, pub](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+        cloudCallback(msg, pub);
+      });
+    subs_.push_back(sub);
+  }
+
+  // ── 6. Hand off to STVL ────────────────────────────────────────────────────
+  //    STVL reads all the same params. For marking sources it now sees the
+  //    relay topic names we set above. Everything else (decay, voxel size,
+  //    clearing sources, frustum models) is untouched.
+  SpatioTemporalVoxelLayer::onInitialize();
 }
 
-void RingSlopeFilterLayer::updateBounds(
-  double /*robot_x*/, double /*robot_y*/, double /*robot_yaw*/,
-  double * /*min_x*/, double * /*min_y*/,
-  double * /*max_x*/, double * /*max_y*/)
+void RingSlopeSTVLLayer::cloudCallback(
+  sensor_msgs::msg::PointCloud2::ConstSharedPtr msg,
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub)
 {
-  // This layer does not mark the costmap directly; nothing to do here.
-}
-
-void RingSlopeFilterLayer::updateCosts(
-  nav2_costmap_2d::Costmap2D & /*master_grid*/,
-  int /*min_i*/, int /*min_j*/, int /*max_i*/, int /*max_j*/)
-{
-  // This layer does not mark the costmap directly; nothing to do here.
-}
-
-void RingSlopeFilterLayer::cloudCallback(sensor_msgs::msg::PointCloud2::SharedPtr msg)
-{
-  // Work on a copy so we don't mutate the original message in the middleware
+  // Copy so we can mutate in-place without touching the original message
   auto filtered = std::make_shared<sensor_msgs::msg::PointCloud2>(*msg);
   applyRingSlopeFilter(*filtered);
-  pub_->publish(std::move(*filtered));
+  pub->publish(std::move(*filtered));
 }
 
-void RingSlopeFilterLayer::applyRingSlopeFilter(sensor_msgs::msg::PointCloud2 & cloud) const
+void RingSlopeSTVLLayer::applyRingSlopeFilter(sensor_msgs::msg::PointCloud2 & cloud) const
 {
-  if (cloud.height <= 1) { return; }
+  // Requires an organized cloud (height > 1). Unorganized clouds pass through.
+  if (cloud.height <= 1) {
+    return;
+  }
 
+  // Locate x, y, z field byte offsets within the point stride
   int x_off = -1, y_off = -1, z_off = -1;
   for (const auto & field : cloud.fields) {
     if (field.name == "x") { x_off = static_cast<int>(field.offset); }
     if (field.name == "y") { y_off = static_cast<int>(field.offset); }
     if (field.name == "z") { z_off = static_cast<int>(field.offset); }
   }
-  if (x_off < 0 || y_off < 0 || z_off < 0) { return; }
+  if (x_off < 0 || y_off < 0 || z_off < 0) {
+    return;
+  }
 
   const uint32_t W  = cloud.width;
   const uint32_t H  = cloud.height;
@@ -100,12 +145,14 @@ void RingSlopeFilterLayer::applyRingSlopeFilter(sensor_msgs::msg::PointCloud2 & 
   const uint32_t rs = cloud.row_step;
   uint8_t * data    = cloud.data.data();
 
+  // Read a float field from the raw buffer
   auto read_f = [&](uint32_t row, uint32_t col, int off) -> float {
     float v;
     std::memcpy(&v, data + row * rs + col * ps + off, sizeof(float));
     return v;
   };
 
+  // NaN out a point so downstream PCL/STVL filters discard it
   auto nan_point = [&](uint32_t row, uint32_t col) {
     constexpr float nan = std::numeric_limits<float>::quiet_NaN();
     uint8_t * p = data + row * rs + col * ps;
@@ -114,23 +161,27 @@ void RingSlopeFilterLayer::applyRingSlopeFilter(sensor_msgs::msg::PointCloud2 & 
     std::memcpy(p + z_off, &nan, sizeof(float));
   };
 
-  // Per-column working buffer: only finite returns, sorted by z
+  // Per-column buffer: finite returns sorted by z for true elevation order.
+  // Sorting is independent of how the Ouster driver orders beam rows, fixing
+  // the ring-ordering issue.
   struct RingPoint { float x, y, z; uint32_t row; };
   std::vector<RingPoint> col_pts;
   col_pts.reserve(H);
 
   const float slope_thresh = static_cast<float>(slope_threshold_);
   const float min_dz_f     = static_cast<float>(min_dz_);
-  constexpr float kMinDxy  = 1e-3f;
+  constexpr float kMinDxy  = 1e-3f;  // 1 mm — treat smaller as near-vertical
 
-  // Returns dz/dxy between two points.
-  // Returns FLT_MAX (i.e. "keep") if below noise floor or near-vertical.
+  // slope_ratio between two ring points.
+  // Returns FLT_MAX ("keep as obstacle") when:
+  //   - |dz| is below the noise floor, or
+  //   - dxy is near-zero (near-vertical face).
   auto slope_ratio = [&](const RingPoint & a, const RingPoint & b) -> float {
     const float dz  = std::abs(b.z - a.z);
-    const float dxy = std::sqrt((b.x - a.x) * (b.x - a.x) +
-                                (b.y - a.y) * (b.y - a.y));
+    const float dxy = std::sqrt(
+      (b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y));
     if (dz < min_dz_f || dxy < kMinDxy) {
-      return std::numeric_limits<float>::max();  // treat as obstacle (keep)
+      return std::numeric_limits<float>::max();
     }
     return dz / dxy;
   };
@@ -149,17 +200,26 @@ void RingSlopeFilterLayer::applyRingSlopeFilter(sensor_msgs::msg::PointCloud2 & 
     }
 
     // Need at least 3 points to have any interior points to evaluate
-    if (col_pts.size() < 3) { continue; }
+    if (col_pts.size() < 3) {
+      continue;
+    }
 
-    // Sort by z (ascending) to get true elevation order regardless of
-    // how the driver orders beam rows in the organized cloud
-    std::sort(col_pts.begin(), col_pts.end(),
+    // Sort ascending by z so adjacent indices are adjacent elevation angles
+    std::sort(
+      col_pts.begin(), col_pts.end(),
       [](const RingPoint & a, const RingPoint & b) { return a.z < b.z; });
 
-    // For each interior point, require BOTH its elevation neighbors to
-    // independently agree it looks like ground before suppressing it.
-    // This protects obstacle edges (one neighbor is on the obstacle,
-    // one is on the ground → they won't both agree → point is kept).
+    // For each interior point, require BOTH elevation neighbours to agree
+    // it looks like ground before suppressing it.
+    //
+    // This protects obstacle edges: at a wall/ground boundary one neighbour
+    // is on the obstacle (high slope_ratio) and one is on the ground
+    // (low slope_ratio). They will not both agree -> point is kept.
+    //
+    // First and last points in the sorted column are skipped — they have
+    // only one neighbour so there is no confirmation vote available.
+    // The lowest return per column is almost always ground; leaving it
+    // intact is correct and conservative.
     const size_t N = col_pts.size();
     for (size_t i = 1; i < N - 1; ++i) {
       const float r_below = slope_ratio(col_pts[i - 1], col_pts[i]);
@@ -169,12 +229,11 @@ void RingSlopeFilterLayer::applyRingSlopeFilter(sensor_msgs::msg::PointCloud2 & 
         nan_point(col_pts[i].row, col);
       }
     }
-    // First and last points in the column are skipped — they have only
-    // one neighbor so there is no second vote to confirm ground.
-    // The lowest return in a column is almost always ground anyway.
   }
 }
 
 }  // namespace custom_costmap_layers
 
-PLUGINLIB_EXPORT_CLASS(custom_costmap_layers::RingSlopeFilterLayer, nav2_costmap_2d::Layer)
+PLUGINLIB_EXPORT_CLASS(
+  custom_costmap_layers::RingSlopeSTVLLayer,
+  nav2_costmap_2d::Layer)

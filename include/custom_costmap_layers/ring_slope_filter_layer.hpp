@@ -12,83 +12,93 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef CUSTOM_COSTMAP_LAYERS__RING_SLOPE_FILTER_LAYER_HPP_
-#define CUSTOM_COSTMAP_LAYERS__RING_SLOPE_FILTER_LAYER_HPP_
+#ifndef CUSTOM_COSTMAP_LAYERS__RING_SLOPE_STVL_LAYER_HPP_
+#define CUSTOM_COSTMAP_LAYERS__RING_SLOPE_STVL_LAYER_HPP_
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <sstream>
 #include <string>
+#include <vector>
 
-#include "nav2_costmap_2d/layer.hpp"
-#include "nav2_costmap_2d/layered_costmap.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
+#include "spatio_temporal_voxel_layer/spatio_temporal_voxel_layer.hpp"
 
 namespace custom_costmap_layers
 {
 
 /**
- * @brief A passthrough costmap layer that subscribes to an organized
- *        PointCloud2, suppresses returns that are characteristic of rising
- *        ground rather than true obstacles, and republishes the filtered
- *        cloud on a new topic for STVL (or any other consumer) to mark from.
+ * @brief Drop-in replacement for SpatioTemporalVoxelLayer that applies a
+ *        ring-based slope filter to each organized PointCloud2 before it
+ *        reaches STVL's measurement buffers.
  *
- * The filter walks adjacent elevation rings at the same azimuth column.
- * For each pair of vertically-adjacent ring points it computes:
+ * How it works
+ * ------------
+ * During onInitialize() this class:
+ *   1. Reads the same observation_sources param that STVL would read.
+ *   2. For every marking source, saves the configured topic and redirects
+ *      the param to an internal relay topic (<original>_rsf_<source>).
+ *   3. Subscribes to the original topic, applies the ring slope filter
+ *      in-place on a copy, and publishes to the relay topic.
+ *   4. Calls SpatioTemporalVoxelLayer::onInitialize(), which picks up the
+ *      redirected topic params and sets up all voxel machinery as normal.
  *
- *     slope_ratio = |dz| / dxy
+ * The relay topics are an implementation detail — users configure this
+ * layer exactly like a normal STVL layer and add two extra params:
+ *   slope_threshold  (dz/dxy, default 1.0 = 45 deg)
+ *   min_dz           (metres, default 0.03 = 3 cm noise floor)
  *
- * A high ratio (near-vertical) means the lidar hit a wall/obstacle.
- * A low ratio (proportional horizontal travel) means it hit sloped ground.
- * Points whose ratio is at or below `slope_threshold` are NaN-ed out so
- * downstream filters discard them.
- *
- * This layer does NOT write to the costmap itself; it only acts as a
- * preprocessing relay. Place it before your STVL layer in the plugin list.
+ * Ring slope filter logic
+ * -----------------------
+ * For each azimuth column in the organized cloud:
+ *   - Collect all finite returns and sort by z (true elevation order,
+ *     independent of how the driver orders beam rows).
+ *   - For each interior point, compute slope_ratio to both its lower and
+ *     upper elevation neighbours.
+ *   - Only suppress the point if BOTH neighbours independently agree the
+ *     transition looks like sloped ground (ratio <= slope_threshold).
+ *     This protects obstacle edges where one neighbour is on the obstacle
+ *     and one is on the ground — they will not both agree.
+ *   - Points below min_dz or with near-zero dxy are left intact.
  */
-class RingSlopeFilterLayer : public nav2_costmap_2d::Layer
+class RingSlopeSTVLLayer : public spatio_temporal_voxel_layer::SpatioTemporalVoxelLayer
 {
 public:
-  RingSlopeFilterLayer();
-  ~RingSlopeFilterLayer() override = default;
+  RingSlopeSTVLLayer();
+  ~RingSlopeSTVLLayer() override = default;
 
-  // nav2_costmap_2d::Layer interface
   void onInitialize() override;
-  void updateBounds(
-    double robot_x, double robot_y, double robot_yaw,
-    double * min_x, double * min_y,
-    double * max_x, double * max_y) override;
-  void updateCosts(
-    nav2_costmap_2d::Costmap2D & master_grid,
-    int min_i, int min_j, int max_i, int max_j) override;
-  bool isClearable() override { return false; }
-  void reset() override {}
 
 private:
   /**
-   * @brief Subscriber callback: apply the ring slope filter in-place and
-   *        republish on output_topic_.
+   * @brief Subscription callback: filter and republish.
+   * @param msg   Original organized cloud from the sensor.
+   * @param pub   Publisher to the relay topic STVL is subscribed to.
    */
-  void cloudCallback(sensor_msgs::msg::PointCloud2::SharedPtr msg);
+  void cloudCallback(
+    sensor_msgs::msg::PointCloud2::ConstSharedPtr msg,
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub);
 
   /**
    * @brief Mutates cloud in-place, NaN-ing points classified as ground slope.
-   *        Requires an organized cloud (height > 1).
+   *        Requires an organized cloud (height > 1). Unorganized clouds are
+   *        passed through unchanged.
    */
   void applyRingSlopeFilter(sensor_msgs::msg::PointCloud2 & cloud) const;
 
-  // Parameters
-  std::string input_topic_;
-  std::string output_topic_;
-  double slope_threshold_;   // dz/dxy; points at or below this ratio are suppressed
-  double min_dz_;            // noise floor in metres; pairs with |dz| < this are skipped
+  // Filter parameters
+  double slope_threshold_;  // dz/dxy <= this is treated as ground and suppressed
+  double min_dz_;           // |dz| below this is ignored (noise floor, metres)
 
-  // ROS interfaces
-  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_;
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_;
+  // One subscription + publisher pair per intercepted marking source
+  std::vector<rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr> subs_;
+  std::vector<rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr> pubs_;
 };
 
 }  // namespace custom_costmap_layers
 
-#endif  // CUSTOM_COSTMAP_LAYERS__RING_SLOPE_FILTER_LAYER_HPP_
+#endif  // CUSTOM_COSTMAP_LAYERS__RING_SLOPE_STVL_LAYER_HPP_
