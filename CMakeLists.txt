@@ -10,7 +10,6 @@ find_package(nav_msgs REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
-find_package(spatio_temporal_voxel_layer REQUIRED)
 
 add_library(${PROJECT_NAME} SHARED
   src/terrain_global_layer.cpp
