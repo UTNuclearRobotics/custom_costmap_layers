@@ -1,4 +1,5 @@
 <library path="custom_costmap_layers">
+
   <class name="nav2_costmap_2d/TerrainGlobalLayer"
          type="nav2_costmap_2d::TerrainGlobalLayer"
          base_class_type="nav2_costmap_2d::Layer">
@@ -6,4 +7,15 @@
       Layer that continuously merges terrain/sterling costmap into the global costmap
     </description>
   </class>
+
+  <class name="custom_costmap_layers/RingSlopeFilterLayer"
+         type="custom_costmap_layers::RingSlopeFilterLayer"
+         base_class_type="nav2_costmap_2d::Layer">
+    <description>
+      Preprocesses an organized PointCloud2 to suppress uneven ground returns
+      by comparing dz/dxy between adjacent lidar rings. Republishes the filtered
+      cloud for downstream STVL marking.
+    </description>
+  </class>
+
 </library>
