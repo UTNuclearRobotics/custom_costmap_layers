@@ -25,7 +25,6 @@ ament_target_dependencies(${PROJECT_NAME}
   pluginlib
   geometry_msgs
   sensor_msgs
-  spatio_temporal_voxel_layer
 )
 
 target_include_directories(${PROJECT_NAME} PUBLIC
