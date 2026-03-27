@@ -84,79 +84,94 @@ void RingSlopeFilterLayer::cloudCallback(sensor_msgs::msg::PointCloud2::SharedPt
 
 void RingSlopeFilterLayer::applyRingSlopeFilter(sensor_msgs::msg::PointCloud2 & cloud) const
 {
-  // The filter requires an organized cloud so that adjacent rows correspond
-  // to adjacent elevation rings at the same azimuth column.
-  // Ouster lidars always publish organized clouds. Skip silently otherwise.
-  if (cloud.height <= 1) {
-    return;
-  }
+  if (cloud.height <= 1) { return; }
 
-  // Locate x, y, z field byte offsets within the point stride
   int x_off = -1, y_off = -1, z_off = -1;
   for (const auto & field : cloud.fields) {
     if (field.name == "x") { x_off = static_cast<int>(field.offset); }
     if (field.name == "y") { y_off = static_cast<int>(field.offset); }
     if (field.name == "z") { z_off = static_cast<int>(field.offset); }
   }
-  if (x_off < 0 || y_off < 0 || z_off < 0) {
-    return;
-  }
+  if (x_off < 0 || y_off < 0 || z_off < 0) { return; }
 
-  const uint32_t W          = cloud.width;
-  const uint32_t H          = cloud.height;
-  const uint32_t point_step = cloud.point_step;
-  const uint32_t row_step   = cloud.row_step;
-  uint8_t * data             = cloud.data.data();
+  const uint32_t W  = cloud.width;
+  const uint32_t H  = cloud.height;
+  const uint32_t ps = cloud.point_step;
+  const uint32_t rs = cloud.row_step;
+  uint8_t * data    = cloud.data.data();
 
   auto read_f = [&](uint32_t row, uint32_t col, int off) -> float {
     float v;
-    std::memcpy(&v, data + row * row_step + col * point_step + off, sizeof(float));
+    std::memcpy(&v, data + row * rs + col * ps + off, sizeof(float));
     return v;
   };
 
   auto nan_point = [&](uint32_t row, uint32_t col) {
     constexpr float nan = std::numeric_limits<float>::quiet_NaN();
-    uint8_t * p = data + row * row_step + col * point_step;
+    uint8_t * p = data + row * rs + col * ps;
     std::memcpy(p + x_off, &nan, sizeof(float));
     std::memcpy(p + y_off, &nan, sizeof(float));
     std::memcpy(p + z_off, &nan, sizeof(float));
   };
 
-  // Walk every azimuth column, comparing each ring with the next.
+  // Per-column working buffer: only finite returns, sorted by z
+  struct RingPoint { float x, y, z; uint32_t row; };
+  std::vector<RingPoint> col_pts;
+  col_pts.reserve(H);
+
+  const float slope_thresh = static_cast<float>(slope_threshold_);
+  const float min_dz_f     = static_cast<float>(min_dz_);
+  constexpr float kMinDxy  = 1e-3f;
+
+  // Returns dz/dxy between two points.
+  // Returns FLT_MAX (i.e. "keep") if below noise floor or near-vertical.
+  auto slope_ratio = [&](const RingPoint & a, const RingPoint & b) -> float {
+    const float dz  = std::abs(b.z - a.z);
+    const float dxy = std::sqrt((b.x - a.x) * (b.x - a.x) +
+                                (b.y - a.y) * (b.y - a.y));
+    if (dz < min_dz_f || dxy < kMinDxy) {
+      return std::numeric_limits<float>::max();  // treat as obstacle (keep)
+    }
+    return dz / dxy;
+  };
+
   for (uint32_t col = 0; col < W; ++col) {
-    for (uint32_t row = 0; row < H - 1; ++row) {
-      const float x0 = read_f(row,     col, x_off);
-      const float y0 = read_f(row,     col, y_off);
-      const float z0 = read_f(row,     col, z_off);
-      const float x1 = read_f(row + 1, col, x_off);
-      const float y1 = read_f(row + 1, col, y_off);
-      const float z1 = read_f(row + 1, col, z_off);
+    col_pts.clear();
 
-      // Skip pairs that contain invalid returns
-      if (!std::isfinite(x0) || !std::isfinite(x1)) {
-        continue;
-      }
-
-      const float dz  = std::abs(z1 - z0);
-      const float dxy = std::sqrt((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0));
-
-      // Ignore transitions below the noise floor
-      if (dz < static_cast<float>(min_dz_)) {
-        continue;
-      }
-
-      // Near-vertical face (dxy ≈ 0): slope ratio → ∞, definitely an obstacle
-      constexpr float kMinDxy = 1e-3f;
-      if (dxy < kMinDxy) {
-        continue;
-      }
-
-      // Ground slope: dz proportional to dxy → ratio at or below threshold
-      // Suppress the upper-ring point from downstream marking
-      if ((dz / dxy) <= static_cast<float>(slope_threshold_)) {
-        nan_point(row + 1, col);
+    // Collect all finite returns in this azimuth column
+    for (uint32_t row = 0; row < H; ++row) {
+      const float x = read_f(row, col, x_off);
+      const float y = read_f(row, col, y_off);
+      const float z = read_f(row, col, z_off);
+      if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z)) {
+        col_pts.push_back({x, y, z, row});
       }
     }
+
+    // Need at least 3 points to have any interior points to evaluate
+    if (col_pts.size() < 3) { continue; }
+
+    // Sort by z (ascending) to get true elevation order regardless of
+    // how the driver orders beam rows in the organized cloud
+    std::sort(col_pts.begin(), col_pts.end(),
+      [](const RingPoint & a, const RingPoint & b) { return a.z < b.z; });
+
+    // For each interior point, require BOTH its elevation neighbors to
+    // independently agree it looks like ground before suppressing it.
+    // This protects obstacle edges (one neighbor is on the obstacle,
+    // one is on the ground → they won't both agree → point is kept).
+    const size_t N = col_pts.size();
+    for (size_t i = 1; i < N - 1; ++i) {
+      const float r_below = slope_ratio(col_pts[i - 1], col_pts[i]);
+      const float r_above = slope_ratio(col_pts[i],     col_pts[i + 1]);
+
+      if (r_below <= slope_thresh && r_above <= slope_thresh) {
+        nan_point(col_pts[i].row, col);
+      }
+    }
+    // First and last points in the column are skipped — they have only
+    // one neighbor so there is no second vote to confirm ground.
+    // The lowest return in a column is almost always ground anyway.
   }
 }
 
